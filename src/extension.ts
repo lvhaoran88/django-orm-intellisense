@@ -22,10 +22,17 @@ import {
   ServerOptions,
 } from 'vscode-languageclient/node';
 import {PythonExtension} from '@vscode/python-extension';
+import { genCompletionItemDocForDjangoModelField, getDjangoModels, getModelNameFromSignature } from './analizer/djangoModel';
 
 let client: LanguageClient;
 let statusBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
+
+// 自定义全局变量
+let djangoModels = {
+  model: {},
+  field_lookup: {},
+}
 
 /// Get a setting at the path, or throw an error if it's not set.
 function requireSetting<T>(path: string): T {
@@ -253,7 +260,7 @@ export async function activate(context: ExtensionContext) {
     args: args,
   };
   let rawInitialisationOptions = vscode.workspace.getConfiguration('pyrefly');
-
+  console.log('Pyrefly initialisation options:', rawInitialisationOptions);
   // Options to control the language client
   let clientOptions: LanguageClientOptions = {
     initializationOptions: rawInitialisationOptions,
@@ -356,6 +363,59 @@ export async function activate(context: ExtensionContext) {
     }),
   );
 
+  // 注册一个智能提示器提供者
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      { scheme: 'file', language: 'python' },
+      {
+        async provideCompletionItems(
+          document: vscode.TextDocument,
+          position: vscode.Position,
+          token: vscode.CancellationToken,
+          context: vscode.CompletionContext,
+        ): Promise<vscode.CompletionItem[] | undefined> {
+            // Ask the server for signature help at the current position.
+            const params = client.code2ProtocolConverter.asTextDocumentPositionParams(
+              document,
+              position,
+            );
+            const signatureHelp = await client.sendRequest<any>(
+              'textDocument/signatureHelp',
+              params,
+            );
+
+            if (!signatureHelp) {
+              return undefined;
+            }
+            
+            // 找到当前光标到 '(' 或 ',' 之间的文本，作为过滤token
+            // 优先找 ',', 如果没有找到，则找 '('
+            const lineText = document.lineAt(position.line).text;
+            let filterToken = "";
+            for (let i = position.character - 1; i >= 0; i--) {
+              const char = lineText[i];
+              if (char === ',' || char === '(') {
+                break;
+              }
+              filterToken = char + filterToken;
+            }
+            filterToken = filterToken.trim();
+
+            
+
+            // Derive the model name from the signature help using the helper.
+            const modelName = getModelNameFromSignature(signatureHelp);
+            const result = genCompletionItemDocForDjangoModelField(modelName, djangoModels, filterToken);
+            return result;
+        },
+      },
+      "(",
+      ",",
+      "_"
+    ),
+  );
+
+
   // When our extension is activated, make sure ms-python knows
   // TODO(kylei): remove this hack once ms-python has this behavior
   await triggerMsPythonRefreshLanguageServers();
@@ -369,6 +429,10 @@ export async function activate(context: ExtensionContext) {
 
   // Start the client. This will also launch the server
   await client.start();
+
+  djangoModels = await getDjangoModels();
+
+  console.log('collected Django Models:', djangoModels);
 
   await updateStatusBar();
   context.subscriptions.push(statusBarItem);
