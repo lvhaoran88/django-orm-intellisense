@@ -196,7 +196,6 @@
     },
     "dependencies": {
         "@vscode/python-extension": "^1.0.5",
-        "python-ast": "^0.1.0",
         "vsce": "^2.15.0",
         "vscode-languageclient": "9.0.1"
     },
