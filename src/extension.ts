@@ -14,7 +14,6 @@ import {
   ConfigurationItem,
   ConfigurationParams,
   ConfigurationRequest,
-  DidChangeConfigurationNotification,
   LanguageClient,
   LanguageClientOptions,
   LSPAny,
@@ -23,9 +22,9 @@ import {
 } from 'vscode-languageclient/node';
 import {PythonExtension} from '@vscode/python-extension';
 import { genCompletionItemDocForDjangoModelField, getDjangoModels, getModelNameFromSignature } from './analizer/djangoModel';
+import { pyreflyConfig } from './config';
 
 let client: LanguageClient;
-let statusBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 
 // 自定义全局变量
@@ -43,73 +42,6 @@ function requireSetting<T>(path: string): T {
   return ret;
 }
 
-/// Update the status bar based on current configuration
-async function updateStatusBar() {
-  const document = vscode.window.activeTextEditor?.document;
-  if (
-    document == null ||
-    (document.uri.scheme !== 'file' &&
-      document.uri.scheme !== 'vscode-notebook-cell') ||
-    document.languageId !== 'python'
-  ) {
-    statusBarItem?.hide();
-    return;
-  }
-  let status;
-  try {
-    status = await client.sendRequest(
-      'pyrefly/textDocument/typeErrorDisplayStatus',
-      client.code2ProtocolConverter.asTextDocumentItem(document),
-    );
-  } catch {
-    statusBarItem?.hide();
-    return;
-  }
-
-  if (!statusBarItem) {
-    statusBarItem = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Right,
-    );
-    statusBarItem.name = 'Pyrefly';
-  }
-
-  switch (status) {
-    case 'disabled-due-to-missing-config-file':
-      statusBarItem.text = 'Pyrefly (error-off)';
-      statusBarItem.tooltip =
-        new vscode.MarkdownString(`Pyrefly type checking is disabled by default.
-Create a [\`pyrefly.toml\`](https://pyrefly.org/en/docs/configuration/) file or set disableTypeErrors to false in settings to show type errors.`);
-      break;
-    case 'disabled-in-ide-config':
-      statusBarItem.text = 'Pyrefly (error-off)';
-      statusBarItem.tooltip =
-        new vscode.MarkdownString(`Pyrefly type checking is explicitly disabled.
-No errors will be shown even if there is a [\`pyrefly.toml\`](https://pyrefly.org/en/docs/configuration/) file.`);
-      break;
-    case 'disabled-in-config-file':
-      statusBarItem.text = 'Pyrefly (error-off)';
-      statusBarItem.tooltip = new vscode.MarkdownString(
-        `Pyrefly type checking is disabled through a config file.`,
-      );
-      break;
-    case 'enabled-in-ide-config':
-      statusBarItem.text = 'Pyrefly';
-      statusBarItem.tooltip = new vscode.MarkdownString(
-        'Pyrefly type checking is explicitly enabled.\nType errors will always be shown.',
-      );
-      break;
-    case 'enabled-in-config-file':
-      statusBarItem.text = 'Pyrefly';
-      statusBarItem.tooltip = new vscode.MarkdownString(
-        'Pyrefly type checking is enabled through a config file.',
-      );
-      break;
-    default:
-      statusBarItem?.hide();
-      return;
-  }
-  statusBarItem.show();
-}
 
 async function getDocstringRanges(
   document: vscode.TextDocument,
@@ -217,9 +149,10 @@ async function overridePythonPath(
       return undefined;
     }
     let scopeUri = configurationItems[index].scopeUri;
-    return await pythonExtension.environments.getActiveEnvironmentPath(
+    const pythonPath =  await pythonExtension.environments.getActiveEnvironmentPath(
       scopeUri === undefined ? undefined : vscode.Uri.parse(scopeUri),
     ).path;
+    return pythonPath;
   };
   const newResult = await Promise.all(
     configuration.map(async (item, index) => {
@@ -261,44 +194,53 @@ export async function activate(context: ExtensionContext) {
   };
   let rawInitialisationOptions = vscode.workspace.getConfiguration('pyrefly');
   console.log('Pyrefly initialisation options:', rawInitialisationOptions);
+
+  async function overridePythonPathConfiguration(
+    params: ConfigurationParams,
+    token: CancellationToken,
+    next: ConfigurationRequest.HandlerSignature
+  ): Promise<LSPAny[] | ResponseError<void>> {
+    const result = await next(params, token);
+    if (result instanceof ResponseError) {
+      return result;
+    }
+    let newResult = await overridePythonPath(
+      pythonExtension,
+      params.items,
+      result as (object | null)[]
+    );
+    console.log("Overridden configuration result:", newResult);
+
+    newResult = newResult.map((item, index) => {
+      return {...item, pyrefly: pyreflyConfig} 
+    });
+    console.log("Overridden configuration result:", newResult);
+    return newResult;
+  }
+
   // Options to control the language client
   let clientOptions: LanguageClientOptions = {
     initializationOptions: rawInitialisationOptions,
     // Register the server for Python documents
     documentSelector: [
-      {scheme: 'file', language: 'python'},
+      { scheme: "file", language: "python" },
       // Support for notebook cells
-      {scheme: 'vscode-notebook-cell', language: 'python'},
+      { scheme: "vscode-notebook-cell", language: "python" },
     ],
     // Support for notebooks
     // @ts-ignore
     notebookDocumentSync: {
       notebookSelector: [
         {
-          notebook: {notebookType: 'jupyter-notebook'},
-          cells: [{language: 'python'}],
+          notebook: { notebookType: "jupyter-notebook" },
+          cells: [{ language: "python" }],
         },
       ],
     },
     outputChannel: outputChannel,
     middleware: {
       workspace: {
-        configuration: async (
-          params: ConfigurationParams,
-          token: CancellationToken,
-          next: ConfigurationRequest.HandlerSignature,
-        ): Promise<LSPAny[] | ResponseError<void>> => {
-          const result = await next(params, token);
-          if (result instanceof ResponseError) {
-            return result;
-          }
-          const newResult = await overridePythonPath(
-            pythonExtension,
-            params.items,
-            result as (object | null)[],
-          );
-          return newResult;
-        },
+        configuration: overridePythonPathConfiguration,
       },
     },
   };
@@ -311,30 +253,6 @@ export async function activate(context: ExtensionContext) {
     clientOptions,
   );
 
-  context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor(async () => {
-      await updateStatusBar();
-    }),
-  );
-
-  context.subscriptions.push(
-    pythonExtension.environments.onDidChangeActiveEnvironmentPath(() => {
-      client.sendNotification(DidChangeConfigurationNotification.type, {
-        settings: {},
-      });
-    }),
-  );
-
-  context.subscriptions.push(
-    workspace.onDidChangeConfiguration(async event => {
-      if (event.affectsConfiguration('python.pyrefly')) {
-        client.sendNotification(DidChangeConfigurationNotification.type, {
-          settings: {},
-        });
-      }
-      await updateStatusBar();
-    }),
-  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('pyrefly.restartClient', async () => {
@@ -348,18 +266,6 @@ export async function activate(context: ExtensionContext) {
         clientOptions,
       );
       await client.start();
-    }),
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('pyrefly.foldAllDocstrings', async () => {
-      await runDocstringFoldingCommand('editor.fold');
-    }),
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('pyrefly.unfoldAllDocstrings', async () => {
-      await runDocstringFoldingCommand('editor.unfold');
     }),
   );
 
@@ -415,18 +321,6 @@ export async function activate(context: ExtensionContext) {
     ),
   );
 
-
-  // When our extension is activated, make sure ms-python knows
-  // TODO(kylei): remove this hack once ms-python has this behavior
-  await triggerMsPythonRefreshLanguageServers();
-
-  vscode.workspace.onDidChangeConfiguration(async e => {
-    if (e.affectsConfiguration(`python.pyrefly.disableLanguageServices`)) {
-      // TODO(kylei): remove this hack once ms-python has this behavior
-      await triggerMsPythonRefreshLanguageServers();
-    }
-  });
-
   // Start the client. This will also launch the server
   await client.start();
 
@@ -434,34 +328,6 @@ export async function activate(context: ExtensionContext) {
 
   console.log('collected Django Models:', djangoModels);
 
-  await updateStatusBar();
-  context.subscriptions.push(statusBarItem);
-}
-
-/**
- * This function will trigger the ms-python extension to reasses which language server to spin up.
- * It does this by changing languageServer setting: this triggers a refresh of active language
- * servers:
- * https://github.com/microsoft/vscode-python/blob/main/src/client/languageServer/watcher.ts#L296
- *
- * We then change the setting back so we don't end up messing up the users settings.
- */
-async function triggerMsPythonRefreshLanguageServers() {
-  const config = vscode.workspace.getConfiguration('python');
-  const setting = 'languageServer';
-  let previousSetting = config.get(setting);
-  // without the target, we will crash here with "Unable to write to Workspace Settings
-  // because no workspace is opened. Please open a workspace first and try again."
-  await config.update(
-    setting,
-    previousSetting === 'None' ? 'Default' : 'None',
-    vscode.ConfigurationTarget.Global,
-  );
-  await config.update(
-    setting,
-    previousSetting,
-    vscode.ConfigurationTarget.Global,
-  );
 }
 
 export function deactivate(): Thenable<void> | undefined {
